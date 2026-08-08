@@ -14,8 +14,11 @@
 
 #include "wujihand_driver/wujihand_driver_node.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <functional>
+#include <stdexcept>
 
 namespace wujihand_driver {
 
@@ -28,15 +31,24 @@ const std::array<std::string, WujiHandDriverNode::NUM_JOINTS> WujiHandDriverNode
 WujiHandDriverNode::WujiHandDriverNode() : Node("wujihand_driver"), hardware_connected_(false) {
   // Declare parameters
   this->declare_parameter("serial_number", "");
+  this->declare_parameter("expected_handedness", "");
   this->declare_parameter("publish_rate", 1000.0);
   this->declare_parameter("filter_cutoff_freq", 10.0);
   this->declare_parameter("diagnostics_rate", 10.0);
 
   // Get parameters
   serial_number_ = this->get_parameter("serial_number").as_string();
+  expected_handedness_ = this->get_parameter("expected_handedness").as_string();
   publish_rate_ = this->get_parameter("publish_rate").as_double();
   filter_cutoff_freq_ = this->get_parameter("filter_cutoff_freq").as_double();
   diagnostics_rate_ = this->get_parameter("diagnostics_rate").as_double();
+  if ((expected_handedness_ != "" && expected_handedness_ != "left" &&
+       expected_handedness_ != "right") ||
+      !std::isfinite(publish_rate_) || publish_rate_ <= 0.0 ||
+      !std::isfinite(filter_cutoff_freq_) || filter_cutoff_freq_ <= 0.0 ||
+      !std::isfinite(diagnostics_rate_) || diagnostics_rate_ <= 0.0) {
+    throw std::invalid_argument("Invalid WujiHand identity or rate parameter");
+  }
 
   // Initialize last target positions
   last_target_positions_.fill(0.0);
@@ -113,12 +125,17 @@ bool WujiHandDriverNode::connect_hardware() {
     // Disable thread safety check for multi-threaded access
     hand_->disable_thread_safe_check();
 
-    // Enable all joints
-    hand_->write<wujihandcpp::data::joint::Enabled>(true);
-
     // Read handedness (0 = right, 1 = left)
     auto handedness_value = hand_->read<wujihandcpp::data::hand::Handedness>();
     handedness_ = (handedness_value == 0) ? "right" : "left";
+    if (!expected_handedness_.empty() && handedness_ != expected_handedness_) {
+      throw std::runtime_error(
+          "Connected WujiHand is " + handedness_ + ", expected " +
+          expected_handedness_);
+    }
+
+    // Enable only after the explicit serial and handedness contract is verified.
+    hand_->write<wujihandcpp::data::joint::Enabled>(true);
 
     // Read full system firmware version (unified version for the entire system)
     auto version = hand_->read<wujihandcpp::data::hand::FullSystemFirmwareVersion>();
@@ -163,6 +180,13 @@ bool WujiHandDriverNode::connect_hardware() {
     RCLCPP_INFO(this->get_logger(), "Connected to WujiHand (%s)", handedness_.c_str());
     return true;
   } catch (const std::exception& e) {
+    if (hand_) {
+      try {
+        hand_->write<wujihandcpp::data::joint::Enabled>(false);
+      } catch (const std::exception&) {
+        // Keep the original connection error; shutdown is best effort here.
+      }
+    }
     RCLCPP_ERROR(this->get_logger(), "Failed to connect: %s", e.what());
     return false;
   }
@@ -193,34 +217,69 @@ void WujiHandDriverNode::command_callback(const sensor_msgs::msg::JointState::Sh
   // Build position array from JointState message
   // Support both named joints and position-only arrays
   double positions[NUM_FINGERS][JOINTS_PER_FINGER] = {};
+  for (size_t index = 0; index < NUM_JOINTS; ++index) {
+    positions[index / JOINTS_PER_FINGER][index % JOINTS_PER_FINGER] =
+        last_target_positions_[index];
+  }
 
   if (!msg->name.empty()) {
     // Named joints - match by name (support both with and without handedness prefix)
     std::string prefix = handedness_ + "_";
-    for (size_t i = 0; i < msg->name.size() && i < msg->position.size(); ++i) {
+    if (msg->name.size() != NUM_JOINTS || msg->position.size() != NUM_JOINTS) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                          "Rejecting partial named command; expected 20 joints");
+      return;
+    }
+    std::array<bool, NUM_JOINTS> matched{};
+    for (size_t i = 0; i < msg->name.size(); ++i) {
+      if (!std::isfinite(msg->position[i])) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                            "Rejecting non-finite hand position command");
+        return;
+      }
       for (size_t j = 0; j < NUM_JOINTS; ++j) {
         // Match either "finger1_joint1" or "right_finger1_joint1"
         if (msg->name[i] == JOINT_NAMES[j] || msg->name[i] == prefix + JOINT_NAMES[j]) {
           size_t f = j / JOINTS_PER_FINGER;
           size_t jj = j % JOINTS_PER_FINGER;
+          if (matched[j]) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                                "Rejecting duplicate named hand command");
+            return;
+          }
           positions[f][jj] = msg->position[i];
-          last_target_positions_[j] = msg->position[i];
+          matched[j] = true;
           break;
         }
       }
     }
+    if (std::find(matched.begin(), matched.end(), false) != matched.end()) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                          "Rejecting command whose names do not match connected hand");
+      return;
+    }
   } else {
     // Position-only array - use index order
-    for (size_t i = 0; i < msg->position.size() && i < NUM_JOINTS; ++i) {
+    if (msg->position.size() != NUM_JOINTS ||
+        std::any_of(msg->position.begin(), msg->position.end(),
+                    [](const double value) { return !std::isfinite(value); })) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                          "Rejecting malformed position-only hand command");
+      return;
+    }
+    for (size_t i = 0; i < msg->position.size(); ++i) {
       size_t f = i / JOINTS_PER_FINGER;
       size_t j = i % JOINTS_PER_FINGER;
       positions[f][j] = msg->position[i];
-      last_target_positions_[i] = msg->position[i];
     }
   }
 
   // Send to hardware
   controller_->set_joint_target_position(positions);
+  for (size_t index = 0; index < NUM_JOINTS; ++index) {
+    last_target_positions_[index] =
+        positions[index / JOINTS_PER_FINGER][index % JOINTS_PER_FINGER];
+  }
 }
 
 void WujiHandDriverNode::publish_state() {
