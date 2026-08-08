@@ -14,6 +14,7 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(wujihand_msgs REQUIRED)
+find_package(Threads REQUIRED)
 
 # Find wujihandcpp. PrimeU pins the official source next to wujihandros2 so a
 # release can be rebuilt without first mutating /usr on every controller.
@@ -27,16 +28,50 @@ if(DEFINED ENV{WUJIHANDPY_SOURCE_DIR})
 elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../wujihandpy/wujihandcpp/CMakeLists.txt")
     set(WUJIHANDCPP_SOURCE_DIR
         "${CMAKE_CURRENT_SOURCE_DIR}/../../wujihandpy/wujihandcpp")
-    set(_WUJIHAND_DRIVER_BUILD_TESTING "${BUILD_TESTING}")
-    set(BUILD_TESTING OFF)
-    set(BUILD_STATIC_WUJIHANDCPP ON CACHE BOOL "" FORCE)
-    add_subdirectory(
-        "${WUJIHANDCPP_SOURCE_DIR}"
-        "${CMAKE_CURRENT_BINARY_DIR}/wujihandcpp"
-        EXCLUDE_FROM_ALL)
-    set(BUILD_TESTING "${_WUJIHAND_DRIVER_BUILD_TESTING}")
+
+    # Compile the pinned official sources directly. This keeps the SDK
+    # submodule at its published tag while avoiding its network-only
+    # FetchContent path. Ubuntu's system spdlog uses external fmt, so generate
+    # the one compatibility source in the build tree rather than patching the
+    # vendor checkout.
+    file(GLOB_RECURSE WUJIHANDCPP_SOURCES CONFIGURE_DEPENDS
+        "${WUJIHANDCPP_SOURCE_DIR}/src/*.cpp"
+        "${WUJIHANDCPP_SOURCE_DIR}/src/*.c")
+    set(WUJIHANDCPP_LOGGING_SOURCE
+        "${WUJIHANDCPP_SOURCE_DIR}/src/logging/logging.cpp")
+    list(REMOVE_ITEM WUJIHANDCPP_SOURCES "${WUJIHANDCPP_LOGGING_SOURCE}")
+    file(READ "${WUJIHANDCPP_LOGGING_SOURCE}" WUJIHANDCPP_LOGGING_CONTENT)
+    string(REPLACE
+        "#include <spdlog/fmt/bundled/base.h>"
+        "#include <fmt/core.h>"
+        WUJIHANDCPP_LOGGING_CONTENT
+        "${WUJIHANDCPP_LOGGING_CONTENT}")
+    set(WUJIHANDCPP_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated_wujihandcpp")
+    file(MAKE_DIRECTORY "${WUJIHANDCPP_GENERATED_DIR}")
+    set(WUJIHANDCPP_GENERATED_LOGGING
+        "${WUJIHANDCPP_GENERATED_DIR}/logging.cpp")
+    file(WRITE "${WUJIHANDCPP_GENERATED_LOGGING}"
+        "${WUJIHANDCPP_LOGGING_CONTENT}")
+    list(APPEND WUJIHANDCPP_SOURCES "${WUJIHANDCPP_GENERATED_LOGGING}")
+
+    find_package(spdlog CONFIG REQUIRED)
+    add_library(primeu_wujihandcpp STATIC ${WUJIHANDCPP_SOURCES})
+    target_compile_features(primeu_wujihandcpp PUBLIC cxx_std_20)
+    target_compile_definitions(primeu_wujihandcpp
+        PUBLIC STATIC_LINKING_WUJIHANDCPP WUJIHANDCPP_VERSION="1.5.1"
+        PRIVATE BUILDING_WUJIHANDCPP)
+    target_include_directories(primeu_wujihandcpp
+        PUBLIC "${WUJIHANDCPP_SOURCE_DIR}/include"
+        PRIVATE "${WUJIHANDCPP_SOURCE_DIR}/src"
+        SYSTEM PRIVATE /usr/include/libusb-1.0)
+    set_target_properties(primeu_wujihandcpp PROPERTIES
+        POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(primeu_wujihandcpp
+        PUBLIC spdlog::spdlog usb-1.0 Threads::Threads)
+
     set(WUJIHANDCPP_INCLUDE_DIR "${WUJIHANDCPP_SOURCE_DIR}/include")
-    set(WUJIHANDCPP_LIBRARY wujihandcpp)
+    set(WUJIHANDCPP_LIBRARY primeu_wujihandcpp)
     set(WUJIHANDCPP_SPDLOG_LIBRARY "")
     message(STATUS "Building pinned PrimeU wujihandcpp source: ${WUJIHANDCPP_SOURCE_DIR}")
 else()
@@ -50,11 +85,9 @@ if(NOT WUJIHANDCPP_LIBRARY OR NOT WUJIHANDCPP_INCLUDE_DIR)
     message(FATAL_ERROR "wujihandcpp not found. Please install the wujihandcpp deb package or build wujihandpy first.")
 endif()
 
-if(NOT WUJIHANDCPP_SPDLOG_LIBRARY AND NOT TARGET wujihandcpp)
+if(NOT WUJIHANDCPP_SPDLOG_LIBRARY AND NOT TARGET ${WUJIHANDCPP_LIBRARY})
     message(FATAL_ERROR "spdlog not found. Please install libspdlog-dev or build wujihandpy first.")
 endif()
-
-find_package(Threads REQUIRED)
 
 message(STATUS "Found wujihandcpp: ${WUJIHANDCPP_LIBRARY}")
 message(STATUS "Found wujihandcpp include: ${WUJIHANDCPP_INCLUDE_DIR}")
